@@ -1,0 +1,31 @@
+#You can also flash this zip in #MAGISK Manager app...
+#both will do same thing
+
+ui_print "ArchiKitchen in Android"
+mount_ /data
+rm -rf /data/local/ArchiKitchen
+package_extract_dir data /data
+set_metadata /data/local/ArchiKitchen/archi uid 0 gid 0 mode 755
+set_metadata_recursive /data/local/ArchiKitchen/tools uid 0 gid 0 dmode 755 fmode 755
+unmount /data
+
+mount_ /system
+if [ -f /system/xbin/busybox ]; then
+  ui_print "Removing old busybox in xbin"
+  cd /system/xbin
+  for link in $(ls); do
+    if [ -L $link ]; then
+      case $(readlink $link) in
+        *busybox) rm -f $link ;;
+      esac
+    fi
+  done
+fi
+
+package_extract_file data/local/ArchiKitchen/files/busybox/system/xbin/busybox /system/xbin/busybox
+set_perm 0 0 755 /system/xbin/busybox
+/system/xbin/busybox --install -s /system/xbin
+
+unmount /system
+ui_print "Done...."
+set_progress 1.34

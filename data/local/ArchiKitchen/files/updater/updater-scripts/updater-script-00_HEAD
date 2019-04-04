@@ -1,0 +1,8 @@
+# This updater-script has been automatically generated through ArchiKitchen (http://forum.xda-developers.com/showthread.php?t=2597220)
+package_extract_file("configure.sh", "/tmp/configure.sh");
+set_metadata("/tmp/configure.sh", "uid", 0, "gid", 0, "mode", 0755);
+run_program("/tmp/configure.sh");
+ifelse(is_mounted("/system"), unmount("/system"));
+format("ext4", "EMMC", file_getprop("/tmp/config", "system"), "0", "/system");
+mount("ext4", "EMMC", file_getprop("/tmp/config", "system"), "/system");
+package_extract_dir("system", "/system");

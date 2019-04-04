@@ -1,0 +1,736 @@
+#!/system/bin/sh
+
+set +e
+
+BL='\e[01;90m' > /dev/null 2>&1; # Black
+R='\e[01;91m' > /dev/null 2>&1; # Red
+G='\e[01;92m' > /dev/null 2>&1; # Green
+Y='\e[01;93m' > /dev/null 2>&1; # Yellow
+B='\e[01;94m' > /dev/null 2>&1; # Blue
+P='\e[01;95m' > /dev/null 2>&1; # Purple
+C='\e[01;96m' > /dev/null 2>&1; # Cyan
+W='\e[01;97m' > /dev/null 2>&1; # White
+N='\e[0m' > /dev/null 2>&1; # Null
+
+id="$(id)"; id="${id#*=}"; id="${id%%\(*}"; id="${id%% *}"
+if [ "$id" != "0" ] && [ "$id" != "root" ]; then
+	clear
+	echo ""
+	echo "Type su and then execute"
+	sleep 2
+    clear
+	exit 0
+fi
+
+CURDIR="$(dirname "$(busybox readlink -f "$0")")"
+log="$CURDIR/archi-error.log"
+test -f $log && rm $log
+exec 2>$log
+
+# Initial variables
+export PATH=/system/xbin:$PATH
+TOOLSDIR="tools"
+
+ACTIVE_PROJECT=""
+ARCH="unknown"
+
+META_INF="META-INF/com/google/android"
+UPDATER_SCRIPT_SYMLINKS="updater-script-10_SYMLINKS"
+UPDATER_SCRIPT_PERMISSIONS="updater-script-20_PERMISSIONS"
+
+#  _____                 _   _
+# |  ___|   _ _ __   ___| |_(_) ___  _ __  ___
+# | |_ | | | | '_ \ / __| __| |/ _ \| '_ \/ __|
+# |  _|| |_| | | | | (__| |_| | (_) | | | \__ \
+# |_|   \__,_|_| |_|\___|\__|_|\___/|_| |_|___/
+#
+
+### CORE ###
+
+# Waits for user action
+PRESS_ENTER() {
+	echo -n "Press [Enter] key to continue..."
+	read
+}
+
+PRINT_LINE() {
+	echo -e $Y"------------------------------------------------------------"$N
+}
+
+# REMOVE_LINE <file> <line match string>
+REMOVE_LINE() {
+	if [ ! -z "$(grep "$2" $1)" ]; then
+		local line=`grep -n "$2" $1 | head -n1 | cut -d: -f1`
+		sed -i "${line}d" $1
+	fi
+}
+
+# Performs cleaning of files/folders based on given blacklist
+BLACKLIST_CLEAN() {
+	# $1 - target cleaning list
+	# $2 - target folder
+	mkdir -p "$ACTIVE_PROJECT/$2"
+	if [[ -f "files/$1/clean.txt" ]]; then
+		while read line; do
+			if [[ -z "$line" || "$line" = \#* ]]; then
+				continue
+			fi
+			local TARGETS="$(echo "$line" | awk '{print $1}' | cut -d\" -f2)"
+			case "$TARGETS" in
+				/*) ;;
+				*.apk)
+					TARGETS="$(echo "$TARGETS" | rev | cut -d'.' -f2- | rev)"
+					TARGETS="/system/app/$TARGETS /system/app/$TARGETS.apk /system/app/$TARGETS.odex /system/priv-app/$TARGETS /system/priv-app/$TARGETS.apk /system/priv-app/$TARGETS.odex"
+				;;
+				*.jar)
+					TARGETS="$(echo "$TARGETS" | rev | cut -d'.' -f2- | rev)"
+					TARGETS="/system/framework/$TARGETS.jar /system/framework/$TARGETS.odex"
+				;;
+				*.so) TARGETS="/system/lib/$TARGETS" ;;
+			esac
+			for TARGET in $TARGETS; do
+				local TARGETDIR
+				if [[ -e "$ACTIVE_PROJECT"$TARGET ]]; then
+					TARGETDIR="$ACTIVE_PROJECT/$2$(dirname "$TARGET")"
+					mkdir -p "$TARGETDIR"
+					echo "Cleaning $(basename "$ACTIVE_PROJECT$TARGET")"
+				fi
+				mv -f "$ACTIVE_PROJECT"$TARGET "$TARGETDIR" >/dev/null 2>&1 # Yes, we must detect wildcards here
+			done
+		done < "files/$1/clean.txt"
+	fi
+}
+
+# move_dir_content <src_dir> <dst_dir>
+BLACKLIST_CLEAN_RESTORE() {
+	# $1 - target folder
+	local entry out src
+	src=$ACTIVE_PROJECT/$1
+	find "$src" -type f | while read entry; do
+		out="$(echo "$entry" | sed "s|${src}|${ACTIVE_PROJECT}|")"
+		mkdir -p "$(dirname "$out")"
+		mv -f "$entry" "$out"
+	done
+	if [ -z "$(find "$src" -type f)" ]; then
+		rm -rf "$src"
+	fi
+}
+
+# Tries to mount chosen file
+TRY_MOUNT() {
+	if [ ! -e $2 ]; then mkdir -p $2; fi
+	if [ ! "$(mount | grep " $2 ")" ]; then #if not in /proc/mounts i.e., unmounted or not yet mount point created
+		echo "Mounting raw image"
+		mount -t ext4 -o rw,noatime $1 $2 2>/dev/null
+		for i in 0 1 2 3 4 5 6 7; do
+			if [ "$(mount | grep " $2 ")" ]; then break; fi
+			loop=/dev/block/loop$i
+			if [ ! -f "$loop" -o ! -b "$loop" ]; then
+				mknod $loop b 7 $i
+			fi
+			losetup $loop $1 && mount -t ext4 -o loop,noatime $loop $2
+		done
+	else #if has mount point
+		echo "Unmounting raw image"
+		if [ -f "$1" ]; then umount $2; fi
+		loop=$(mount | grep $2 | cut -d" " -f1)
+		if [ -f "$loop" -a -b "$loop" ]; then losetup -d $loop; fi
+	fi
+	echo "Working directory remounted."
+}
+
+# Sets ACTIVE_PROJECT
+SET_PROJECT() {
+	echo
+	echo "You currently don't have any active project set"
+	echo "You can open any project you've created in the past or create a new one:"
+	echo
+	echo "n - Create a new project"
+	echo "e - Use existing project"
+	echo "x - Exit"
+	echo -n "Your choice: "
+	read CHOICE
+	case "$CHOICE" in
+		n|N) NEWPROJECT_STOCK ;;
+		e|E) SET_OLDPROJECT ;;
+		*) exit 0 ;;
+	esac
+}
+
+# Sets old project as active one
+SET_OLDPROJECT() {
+	PRINT_BANNER
+	local COUNT=0
+	local LASTFOUND=""
+	echo "Searching for projects you've created in the past..."
+	echo "=-=-=-=-=-=-=-=-="
+	for line in $(find . -type d -iname "PROJECT_*"); do
+		COUNT=$((COUNT+1))
+		LASTFOUND="$line"
+		basename "$LASTFOUND"
+	done # Avoid a subshell, because we must remember variables
+	echo "=-=-=-=-=-=-=-=-="
+	echo "Found total of $COUNT projects"
+	if [[ "$COUNT" -eq 1 ]]; then
+		ACTIVE_PROJECT="$(basename "$LASTFOUND")" # If we have only one project, there's nothing to choose from, so we can save some precious seconds
+		return 0
+	fi
+	echo "Write a name of any from the projects detected above or 'x' to go back"
+	echo -n "Your selected project: "
+	read CHOICE
+	case "$CHOICE" in
+		x|X) return ;;
+		*)
+			CHOICE="$(basename "$CHOICE")"
+			if [[ -d "$CHOICE" ]]; then
+				ACTIVE_PROJECT="$CHOICE"
+			else
+				echo "Invalid selection"
+				PRESS_ENTER
+			fi
+		;;
+	esac
+}
+
+# Creates a new stock image-based project
+NEWPROJECT_STOCK() {
+	local READY=0
+	while [[ $READY -eq 0 ]]; do
+		echo
+		if [[ -f system.img.ext4 && -f boot.img ]]; then
+			SYSTEMIMG=system.img.ext4
+			BOOTIMG=boot.img
+			READY=1
+			SPARSE=1
+		elif [[ -f system.ext4.win && -f boot.emmc.win ]]; then
+			SYSTEMIMG=system.ext4.win
+			BOOTIMG=boot.emmc.win
+			READY=1
+			SPARSE=0
+		else
+			echo -e  $R"You have to place system.img.ext4 and boot.img or system.ext4.win and boot.emmc.win of twrp backups in working dir"$N
+			exit 0
+		fi
+	done
+
+	ACTIVE_PROJECT="PROJECT_$(date '+%m%d%y_%H%M%S')"
+	echo "Creating $ACTIVE_PROJECT"
+	mkdir -p "$ACTIVE_PROJECT/system"
+
+	# KERNEL
+	mv -f "$BOOTIMG" "$ACTIVE_PROJECT/boot.img"
+
+	# SYSTEM
+	mv -f "$SYSTEMIMG" "$ACTIVE_PROJECT/system.img"
+
+	if [[ "$(od -A n -h -N 5 "$ACTIVE_PROJECT/system.img" | sed 's/ //g')" = "ff3aed260001" ]]; then
+		echo "Given file is a sparse image"
+		echo "Converting sparse image to raw image..."
+		./$TOOLSDIR/simg2img "$ACTIVE_PROJECT/system.img" "$ACTIVE_PROJECT/system.img".simg2img
+		mv -f "$ACTIVE_PROJECT/system.img".simg2img "$ACTIVE_PROJECT/system.img"
+	fi
+	PRESS_ENTER
+	PRINT_BANNER
+	echo
+	echo "Which type of flashable zip you want?"
+	echo
+	echo "i - Create unmodified system flashable"; echo
+	echo "m - System with slight modifications like root etc.,"
+	echo
+	echo -n "Your choice: "
+	read CHOICE
+	echo
+	case $CHOICE in
+		i|I)
+			echo "Creating unmodified system zip"
+			BUILD_META_INF
+			rm -f $ACTIVE_PROJECT/$META_INF/updater-*
+			rm -rf $ACTIVE_PROJECT/system
+			if [ $SPARSE -eq 1 ]; then
+				cp -f files/updater/updater-img $ACTIVE_PROJECT/$META_INF/updater-script
+			else
+				cp -f tools/tar $ACTIVE_PROJECT/tar
+				cp -f files/updater/updater-twrp $ACTIVE_PROJECT/$META_INF/updater-script
+			fi
+			echo -e $G"All done, your ROM should be ready!"$N
+			echo -e $G"Thank you for using ArchiKitchen!"$N
+			PRESS_ENTER
+			exit 0
+	esac
+
+	if [ $SPARSE -eq 1 ]; then
+		TRY_MOUNT "$(readlink -f $ACTIVE_PROJECT/system.img)" "/data/local/tmp/ArchiKitchenLOOP"
+		echo "Extracting everything from mounted system partition..."
+		cp -R /data/local/tmp/ArchiKitchenLOOP/* $ACTIVE_PROJECT/system/
+		TRY_MOUNT "$(readlink -f $ACTIVE_PROJECT/system.img)" "/data/local/tmp/ArchiKitchenLOOP"
+	else
+		echo "Extracting everything from system backup..."
+		./$TOOLSDIR/tar xpf $ACTIVE_PROJECT/system.img -C $ACTIVE_PROJECT/system
+	fi
+	rm -f "$ACTIVE_PROJECT/system.img"
+	rm -f $ACTIVE_PROJECT/system/priv-app/BeautyFace.apk
+	rm -f $ACTIVE_PROJECT/system/app/Gmail2.apk
+	rm -f $ACTIVE_PROJECT/system/app/Hangouts.apk
+
+	# Fix permissions
+	chown -hR 0:0 $ACTIVE_PROJECT
+	chmod -R 755 $ACTIVE_PROJECT
+
+	# Generate required files
+	rm -rf "$ACTIVE_PROJECT/META-INF" # In case we have any bloat from sec_csc.zip or similar
+	BUILD_META_INF
+	BUILD_UPDATER_SCRIPT
+	PRESS_ENTER
+}
+
+# Creates generic META-INF
+BUILD_META_INF() {
+	mkdir -p "$ACTIVE_PROJECT/$META_INF"
+	cp files/updater/update-binary "$ACTIVE_PROJECT/$META_INF/update-binary"
+	for UPDATER_SCRIPT in "files/updater/updater-scripts/"*; do
+		cp "$UPDATER_SCRIPT" "$ACTIVE_PROJECT/$META_INF/"
+	done
+	if [ ! -f $ACTIVE_PROJECT/configure.sh ]; then
+		cp files/updater/configure.sh $ACTIVE_PROJECT/configure.sh
+	fi
+}
+
+# Merges updater-scripts from $1 to our ACTIVE_PROJECT
+UPDATER_SCRIPT_ADD() {
+	local FOLDER="$1"
+	local FILE=""
+	for UPDATER_SCRIPT in "$FOLDER/updater-script-"*; do
+		FILE="$(basename "$UPDATER_SCRIPT")"
+		{
+			echo # This is to ensure that we have a new line BEFORE appending"
+			cat "$UPDATER_SCRIPT"
+			echo # This is to ensure that we have a new line AFTER appending"
+		} >> "$ACTIVE_PROJECT/$META_INF/$FILE"
+		sed -i '/^$/d' "$ACTIVE_PROJECT/$META_INF/$FILE" # This removes safety lines added above
+	done
+}
+
+# Reverts merge of updater-scripts from $1 in our ACTIVE_PROJECT
+UPDATER_SCRIPT_DEL() {
+	local FOLDER="$1"
+	local FILE=""
+	for UPDATER_SCRIPT in "$FOLDER/updater-script-"*; do
+		FILE="$(basename "$UPDATER_SCRIPT")"
+		echo -n "" > "$ACTIVE_PROJECT/$FILE"
+		while read line; do
+			if [[ "$(grep -q "$line" "$UPDATER_SCRIPT"; echo $?)" -eq 1 ]]; then
+				echo "$line" >> "$ACTIVE_PROJECT/$FILE"
+			fi
+		done < "$ACTIVE_PROJECT/$META_INF/$FILE"
+		mv -f "$ACTIVE_PROJECT/$FILE" "$ACTIVE_PROJECT/$META_INF/$FILE"
+	done
+}
+
+# Builds final updater-script from our segments
+BUILD_UPDATER_SCRIPT() {
+	local HEADER=""
+	echo -n "" > "$ACTIVE_PROJECT/$META_INF/updater-script"
+	for UPDATER_SCRIPT in "$ACTIVE_PROJECT/$META_INF/updater-script-"*; do
+		HEADER="# $(basename "$UPDATER_SCRIPT")"
+		{
+			echo # This is to ensure that we have a new line BEFORE appending"
+			echo "$HEADER"
+			cat "$UPDATER_SCRIPT"
+			echo # This is to ensure that we have a new line AFTER appending"
+		} >> "$ACTIVE_PROJECT/$META_INF/updater-script"
+	done
+	sed -i '/^$/d' "$ACTIVE_PROJECT/$META_INF/updater-script" # This removes safety lines added above
+}
+
+# Removes invalid generic permissions
+FIX_PERMISSIONS() {
+	cp "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_PERMISSIONS" "$ACTIVE_PROJECT/updater-script-TEMP"
+	rm -f "$ACTIVE_PROJECT/updater-script-TEMP-LIST"
+	while read perm; do
+		perm="$(echo "$perm" | cut -d\" -f2)"
+		if [[ -z "$perm" ]]; then
+			continue
+		elif [[ ! -e "$ACTIVE_PROJECT$perm" ]]; then
+			echo "$perm" >> "$ACTIVE_PROJECT/updater-script-TEMP-LIST"
+			grep -v "$perm" "$ACTIVE_PROJECT/updater-script-TEMP" > "$ACTIVE_PROJECT/updater-script-TEMP2"
+			mv -f "$ACTIVE_PROJECT/updater-script-TEMP2" "$ACTIVE_PROJECT/updater-script-TEMP"
+		fi
+	done < "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_PERMISSIONS"
+	if [[ ! -f "$ACTIVE_PROJECT/updater-script-TEMP-LIST" ]]; then
+		rm -f "$ACTIVE_PROJECT/updater-script-TEMP"
+	else
+		rm -f "$ACTIVE_PROJECT/updater-script-TEMP-LIST"
+		mv -f "$ACTIVE_PROJECT/updater-script-TEMP" "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_PERMISSIONS"
+	fi
+}
+
+# Adds local symlinks
+FIX_SYMLINKS() {
+	cp "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_SYMLINKS" "$ACTIVE_PROJECT/updater-script-TEMP"
+	local TARGET=""
+	local REALPATH=""
+	local MAGIC="0"
+	find "$ACTIVE_PROJECT/" -type l | sort | while read SYMLINK; do
+		#if no symlinks found then break
+		if [ -z "$SYMLINK" ]; then break; fi
+		TARGET="$(readlink "$SYMLINK")"
+		REALPATH="$(echo "$SYMLINK" | sed "s/$ACTIVE_PROJECT//")"
+		echo "symlink(\"$TARGET\", \"$REALPATH\");" >> "$ACTIVE_PROJECT/updater-script-TEMP-FOUNDSYMLINKS"
+		echo "$REALPATH -> $TARGET" >> "$ACTIVE_PROJECT/updater-script-TEMP-LIST"
+	done
+	if [[ -f "$ACTIVE_PROJECT/updater-script-TEMP-LIST" ]]; then
+		rm -f "$ACTIVE_PROJECT/updater-script-TEMP-LIST"
+		mv -f "$ACTIVE_PROJECT/updater-script-TEMP-FOUNDSYMLINKS" "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_SYMLINKS"
+	fi
+
+	# Remove duplicated symlinks and sort them
+	sort -u < "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_SYMLINKS" >> "$ACTIVE_PROJECT/updater-script-TEMP"
+	sort -u < "$ACTIVE_PROJECT/updater-script-TEMP" > "$ACTIVE_PROJECT/updater-script-TEMP2"
+	rm -f "$ACTIVE_PROJECT/updater-script-TEMP"
+	mv -f "$ACTIVE_PROJECT/updater-script-TEMP2" "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_SYMLINKS"
+
+	# Remove local symlinks, we don't need them to pollute our ROM
+	find "$ACTIVE_PROJECT/" -type l -delete
+
+	# Remove empty lines, if any
+	sed -i '/^$/d' "$ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_SYMLINKS"
+}
+
+# Extracts the kernel
+KERNEL_EXTRACT() {
+	if [[ ! -f "kernel" ]]; then
+		if [[ -f "$ACTIVE_PROJECT/boot.img" ]]; then
+			./$TOOLSDIR/magiskboot --unpack $ACTIVE_PROJECT/boot.img 2>/dev/null
+			./$TOOLSDIR/magiskboot --cpio ramdisk.cpio "extract default.prop default.prop" 2>/dev/null
+		else
+			echo "ERROR: No kernel could be found!"
+			PRESS_ENTER
+			return 1
+		fi
+	fi
+}
+
+# Repacks the kernel from previously extracted one
+KERNEL_REPACK() {
+	if [[ -f "kernel" ]]; then
+		./$TOOLSDIR/magiskboot --cpio ramdisk.cpio "add 0644 default.prop default.prop" 2>/dev/null
+		./$TOOLSDIR/magiskboot --repack $ACTIVE_PROJECT/boot.img 2>/dev/null
+		mv -f new-boot.img $ACTIVE_PROJECT/boot.img
+		KERNEL_ABORT
+	else
+		echo "ERROR: Could not find the ramdisk!"
+		KERNEL_ABORT
+		PRESS_ENTER
+		return 1
+	fi
+}
+
+# Aborts kernel repacking - performs cleaning
+KERNEL_ABORT() {
+	rm -f default.prop kernel ramdisk.cpio
+}
+
+# Builds ROM
+BUILD() {
+	FIX_PERMISSIONS
+	FIX_SYMLINKS
+	BUILD_UPDATER_SCRIPT
+	echo "Sometimes kitchen may produce an incorrect updater-script file, that's why you're asked to review updater-script and eventually fix it if needed BEFORE building ROM"
+	echo "Updater-script is based on so-called 'segments' available in the same directory - $META_INF"
+	echo "Are you ready?"
+	PRESS_ENTER
+	echo "-=-= UPDATER-SCRIPT START =-=-"
+	cat "$ACTIVE_PROJECT/$META_INF/updater-script"
+	echo "-=-= UPDATER-SCRIPT EOF =-=-"
+	echo -n "Are you REALLY sure that above updater-script is correct? ESPECIALLY block-based paths? [Y/n]: "
+	read CHOICE
+	case "$CHOICE" in
+		n|N)
+			echo "OK, correct your updater-script and/or it's segments and come back when you're finished"
+			PRESS_ENTER
+			return 0
+	esac
+	rm -f $ACTIVE_PROJECT/$META_INF/updater-script-*
+	echo -e $G"All done, your ROM should be ready!"$N
+	echo -e $G"Thank you for using ArchiKitchen!"$N
+	exit 0
+}
+
+# Adds or removes ArchiDroid's Init.d
+ARCHIDROID_INITD() {
+	PERM='set_metadata_recursive("/system/etc/init.d", "uid", 0, "gid", 2000, "dmode", 0755, "fmode", 0755, "capabilities", 0x0, "selabel", "u:object_r:system_file:s0");'
+	if [[ ! -f "$ACTIVE_PROJECT/system/bin/debuggerd.real" ]]; then
+		mv -f "$ACTIVE_PROJECT/system/bin/debuggerd" "$ACTIVE_PROJECT/system/bin/debuggerd.real"
+		cp -R files/initd/system/* "$ACTIVE_PROJECT/system/"
+		echo "$PERM" >> $ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_PERMISSIONS
+	else
+		mv -f "$ACTIVE_PROJECT/system/bin/debuggerd.real" "$ACTIVE_PROJECT/system/bin/debuggerd"
+		rm -f "$ACTIVE_PROJECT/system/etc/init.d/00ARCHIDROID_INITD"
+		rmdir --ignore-fail-on-non-empty "$ACTIVE_PROJECT/system/etc/init.d"
+		REMOVE_LINE $ACTIVE_PROJECT/$META_INF/$UPDATER_SCRIPT_PERMISSIONS "init.d"
+	fi
+	BUILD_UPDATER_SCRIPT
+}
+
+# Adds or removes root
+ROOT() {
+	if [[ ! -f "$ACTIVE_PROJECT/system/xbin/su" ]]; then
+		if [[ -f "$ACTIVE_PROJECT/system/etc/install-recovery.sh" ]]; then
+			mv "/system/etc/install-recovery.sh" "/system/etc/install-recovery-2.sh"
+		fi
+		mkdir -p "$ACTIVE_PROJECT/system/xbin"
+		cp -R files/root/system/* "$ACTIVE_PROJECT/system/"
+		cp "$ACTIVE_PROJECT/system/xbin/su" "$ACTIVE_PROJECT/system/xbin/daemonsu"
+		mkdir -p "$ACTIVE_PROJECT/system/bin/.ext"
+		cp "$ACTIVE_PROJECT/system/xbin/su" "$ACTIVE_PROJECT/system/bin/.ext/.su"
+		UPDATER_SCRIPT_ADD "files/root/updater-scripts"
+	else
+		if [[ -f "$ACTIVE_PROJECT/system/etc/install-recovery-2.sh" ]]; then
+			mv "$ACTIVE_PROJECT/system/etc/install-recovery-2.sh" "$ACTIVE_PROJECT/system/etc/install-recovery.sh"
+		else
+			rm -f "$ACTIVE_PROJECT/system/etc/install-recovery.sh"
+		fi
+		rm -rf "$ACTIVE_PROJECT/system/etc/install-recovery.sh" "$ACTIVE_PROJECT/system/app/Superuser.apk" "$ACTIVE_PROJECT/system/xbin/su" "$ACTIVE_PROJECT/system/xbin/daemonsu" "$ACTIVE_PROJECT/system/xbin/supolicy" "$ACTIVE_PROJECT/system/bin/.ext" "$ACTIVE_PROJECT/system/etc/init.d/99SuperSUDaemon" "$ACTIVE_PROJECT/system/etc/.installed_su_daemon" "$ACTIVE_PROJECT/system/lib/libsupol.so"
+		UPDATER_SCRIPT_DEL "files/root/updater-scripts"
+	fi
+	BUILD_UPDATER_SCRIPT
+}
+
+# Debloats or bloats ROM
+DEBLOAT() {
+	if [[ -d "$ACTIVE_PROJECT/bloatware" ]]; then
+		echo "Restoring bloatware..."
+		BLACKLIST_CLEAN_RESTORE "bloatware"
+		echo "Done, bloatware restored"
+	else
+		echo "Removing bloat..."
+		BLACKLIST_CLEAN "bloat" "bloatware"
+		echo "Done, your ROM should not contain any bloat apps/folders anymore"
+		PRESS_ENTER
+		return
+	fi
+	PRESS_ENTER
+}
+
+# Adds or removes busybox
+BUSYBOX() {
+	if [[ ! -f "$ACTIVE_PROJECT/system/xbin/busybox" ]]; then
+		cp -R "files/busybox/system/"* "$ACTIVE_PROJECT/system/"
+		UPDATER_SCRIPT_ADD "files/busybox/updater-scripts"
+	else
+		rm -f "$ACTIVE_PROJECT/system/app/stericson.busybox.apk"
+		rm -f "$ACTIVE_PROJECT/system/xbin/busybox"
+		UPDATER_SCRIPT_DEL "files/busybox/updater-scripts"
+	fi
+	BUILD_UPDATER_SCRIPT
+}
+
+# Removes KNOX
+REMOVE_KNOX() {
+	if [[ -d "$ACTIVE_PROJECT/knox" ]]; then
+		echo "Restoring knox..."
+		BLACKLIST_CLEAN_RESTORE "knox"
+		echo "Done, knox restored"
+	else
+		echo "Removing KNOX..."
+		BLACKLIST_CLEAN "knox" "knox"
+		echo "Done, your ROM should not contain any KNOX apps/folders anymore"
+		PRESS_ENTER
+	fi
+}
+
+# Adds or removes insecure ADB
+ADB() {
+	if [[ -f "kernel" ]]; then
+		if [[ "$(grep -qi "ro.adb.secure=1" "default.prop"; echo $?)" -eq 0 ]]; then
+			sed -i 's/ro.adb.secure=1/ro.adb.secure=0/g' default.prop
+			sed -i 's/ro.secure=1/ro.secure=0/g' default.prop
+		else
+			sed -i 's/ro.adb.secure=0/ro.adb.secure=1/g' default.prop
+			sed -i 's/ro.secure=0/ro.secure=1/g' default.prop
+		fi
+	fi
+}
+
+# Prints banner
+PRINT_BANNER() {
+	clear
+	echo -e $G"    _             _     _ _  ___ _       _"
+	echo -e "   / \   _ __ ___| |__ (_) |/ (_) |_ ___| |__   ___ _ __"
+	echo -e "  / _ \ | '__/ __| '_ \| | ' /| | __/ __| '_ \ / _ \ '_ \\"
+	echo -e " / ___ \| | | (__| | | | | . \| | || (__| | | |  __/ | | |"
+	echo -e "/_/   \_\_|  \___|_| |_|_|_|\_\_|\__\___|_| |_|\___|_| |_|"
+	echo
+	echo -e "Developed by JustArchi"$N
+	PRINT_LINE
+}
+
+# Prints status of the project
+PRINT_PROJECT_STATUS() {
+	ALLFINE=1
+	if [[ -f "kernel" ]]; then
+		ALLFINE=0
+		echo -e $R"WARNING: Unpacked kernel found"$N
+	fi
+	if [[ ! -f "$ACTIVE_PROJECT/boot.img" ]]; then
+		ALLFINE=0
+		echo -e $R"WARNING: No boot.img found, ROM will not boot properly"$N
+	fi
+	if [[ ! -d "$ACTIVE_PROJECT/META-INF" ]]; then
+		ALLFINE=0
+		echo -e $R"WARNING: No META-INF folder found, this is not a ROM"$N
+	fi
+	echo -n "Project status: "
+	if [[ "$ALLFINE" -eq 1 ]]; then
+		echo -e $G"OK"$N
+	else
+		echo -e $R"WARNING"$N
+	fi
+	PRINT_LINE
+}
+
+# Prints status of the ROM
+PRINT_ROM_STATUS() {
+	echo -n "Architecture: ["
+	if [[ "$ARCH" = "unknown" && -f "$ACTIVE_PROJECT/system/build.prop" ]]; then
+		ARCH="$(grep -i "ro.product.cpu.abi=" "$ACTIVE_PROJECT/system/build.prop" | head -n 1 | cut -d'=' -f2)"
+	fi
+	echo "$ARCH]"
+	echo
+
+	echo -n "ArchiDroid Init.d? "
+	if [[ ! -f "$ACTIVE_PROJECT/system/bin/debuggerd.real" ]]; then
+		echo "[NO]"
+	else
+		echo "[YES]"
+	fi
+	echo -n "Debloated? "
+	if [[ -d "$ACTIVE_PROJECT/bloatware" ]]; then
+		echo "[YES]"
+	else
+		echo "[NO]"
+	fi
+	echo -n "Rooted? "
+	if [[ ! -f "$ACTIVE_PROJECT/system/xbin/su" ]]; then
+		echo "[NO]"
+	else
+		echo "[YES]"
+	fi
+	echo -n "Busybox? "
+	if [[ ! -f "$ACTIVE_PROJECT/system/xbin/busybox" ]]; then
+		echo "[NO]"
+	else
+		echo "[YES]"
+	fi
+	echo -n "DeKNOXed? "
+	if [[ -f "$ACTIVE_PROJECT/system/app/KNOXAgent.apk" ]]; then
+		echo "[NO]"
+	else
+		echo "[YES]"
+	fi
+	if [[ -f "kernel" ]]; then
+		PRINT_LINE
+		echo -n "ADB? "
+		if [[ "$(grep -qi "ro.adb.secure=0" "default.prop"; echo $?)" -eq 0 ]]; then
+			echo "[INSECURE]"
+		else
+			echo "[SECURE]"
+		fi
+	fi
+	PRINT_LINE
+}
+
+# Prints available switches
+PRINT_SWITCHES() {
+	echo "adi   - Enable/Disable ArchiDroid Init.d( debuggerd hook)"
+	echo "r     - Enable/Disable Root"
+	echo "b     - Enable/Disable Busybox"
+	echo "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+"
+	echo "bloat - Debloat/bloat ROM"
+	echo "knox  - Remove/Restore KNOX"
+	echo "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+"
+	if [[ -f "kernel" ]]; then
+		echo "kr    - Repack kernel (apply all ramdisk changes)"
+		echo "ka    - Abort repacking (abort all ramdisk changes)"
+		echo
+		echo "adb   - Enable/Disable insecure ADB"
+	elif [[ -f "$ACTIVE_PROJECT/boot.img" ]]; then
+		echo "ku    - Unpack kernel (this enables more options!)"
+	fi
+	echo "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+"
+	echo "bb    - Build ROM"
+	PRINT_LINE
+	echo "x     - Exit"
+	PRINT_LINE
+}
+
+
+############################
+#   ____ ___  ____  _____  #
+#  / ___/ _ \|  _ \| ____| #
+# | |  | | | | |_) |  _|   #
+# | |__| |_| |  _ <| |___  #
+#  \____\___/|_| \_\_____| #
+#                          #
+############################
+
+PRINT_BANNER
+echo "Please wait..."
+
+# Navigate to our folder, even if user didn't execute it from the root dir
+cd "$CURDIR"
+
+# Make sure our tools are executable
+for i in tools/*; do
+	chmod 755 $i
+done
+
+echo
+
+# Check if symlink support is present
+if [[ "$(ln -s archi archi.ln.test >/dev/null 2>&1; echo $?)" -ne 0 ]]; then
+	echo "ERROR: Current kitchen location doesn't support symbolic links!"
+	echo "Symbolic links cannot be used on filesystems, such as FAT, NTFS"
+	echo "You must use ArchiKitchen such as /data, /tmp, or any other mountpoint, which supports symbolic links"
+	exit 1
+else
+	rm -f archi.ln.test
+fi
+
+while true; do
+	PRINT_BANNER
+
+	if [[ -z "$ACTIVE_PROJECT" ]]; then
+		SET_PROJECT
+		continue
+	fi
+
+	PRINT_PROJECT_STATUS
+	PRINT_ROM_STATUS
+	PRINT_SWITCHES
+	echo -n "CHOICE: "
+	read CHOICE
+	case "$CHOICE" in
+		adi|ADI) ARCHIDROID_INITD ;;
+		bloat|BLOAT) DEBLOAT ;;
+		r|R) ROOT ;;
+		b|B) BUSYBOX ;;
+		knox|KNOX) REMOVE_KNOX ;;
+		
+		adb|ADB) ADB ;;
+		ku|KU) KERNEL_EXTRACT ;;
+		kr|KR) KERNEL_REPACK ;;
+		ka|KA) KERNEL_ABORT ;;
+		bb|BB)
+			if [[ "$ALLFINE" -eq 1 ]]; then
+				BUILD
+			else
+				echo "ERROR: Can't build ROM in actual status, please check warings above and correct them!"
+				PRESS_ENTER
+			fi
+			;;
+		x|X) exit 0
+	esac
+done
+
+exit 0

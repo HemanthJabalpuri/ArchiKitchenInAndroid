@@ -1,0 +1,2 @@
+unmount("/system");
+set_progress(1.000000);

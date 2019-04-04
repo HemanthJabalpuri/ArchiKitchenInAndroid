@@ -1,0 +1,526 @@
+#!/sbin/sh
+# Shell Script EDIFY Replacement: Recovery Flashable Zip
+# osm0sis @ xda-developers
+
+# update-binary is executed by recovery with 3 arguments
+# arg 1 is recovery api version, generally 3.
+# arg 2 is the pipe fd, to the recovery binary.
+# communicate with it using the recovery api.
+# arg 3 is the zip file
+
+export OUTFD=$2;
+export ZIPFILE="$3";
+
+# Detect whether in boot mode
+ps | grep zygote | grep -qv grep && BOOTMODE=true || BOOTMODE=false
+$BOOTMODE || ps -A 2>/dev/null | grep zygote | grep -qv grep && BOOTMODE=true
+
+# ui_print "<message>" ["<message 2>" ...]
+ui_print() {
+  until [ ! "$1" ]; do
+    $BOOTMODE && echo "$1" || echo -e "ui_print $1\nui_print" > /proc/self/fd/$OUTFD;
+    shift;
+  done;
+}
+
+# show_progress <amount> <time>
+show_progress() { $BOOTMODE || echo "progress $1 $2" > /proc/self/fd/$OUTFD; }
+
+# set_progress <amount>
+set_progress() { $BOOTMODE || echo "set_progress $1" > /proc/self/fd/$OUTFD; }
+
+# is_substring <substring> <string>
+is_substring() {
+  case "$2" in
+    *$1*) return 0;;
+    *) return 1;;
+  esac;
+}
+
+# less_than_int <x> <y>
+less_than_int() { test $1 -lt $2 && return 0 || return 1; }
+
+# greater_than_int <x> <y>
+greater_than_int() { test $1 -gt $2 && return 0 || return 1; }
+
+# mount_ <partition>
+mount_() { is_mounted $1 || mount $1 2>/dev/null || mount -o remount,rw $1 2>/dev/null || abort "Aborting..Unable to mount $1"; }
+
+# unmount <partition>
+unmount() { umount "$1" 2>/dev/null; }
+
+# is_mounted <partition>
+is_mounted() { test "$(mount | grep " $1 " | grep "rw,")"; return $?; }
+
+# write_raw_image <file> <block>
+write_raw_image() { dd if="$1" of="$2"; }
+
+# package_extract_file <file> <destination_file>
+package_extract_file() { mkdir -p "$(dirname "$2")"; unzip -o "$ZIPFILE" "$1" -p > "$2"; }
+
+# package_extract_dir <dir> <destination_dir>
+package_extract_dir() {
+  local entry outfile;
+  for entry in $(unzip -l "$ZIPFILE" "$1/*" | tail -n+4 | grep -o " $1.*$" | cut -c2-); do
+    outfile="$(echo "$entry" | sed "s|${1}|${2}|")";
+    mkdir -p "$(dirname "$outfile")";
+    test ! -d "$outfile" && unzip -o "$ZIPFILE" "$entry" -p > "$outfile";
+  done;
+}
+
+# rename <file> <destination_file>
+rename() { mv -f "$1" "$2"; }
+
+# delete <file> [<file2> ...]
+delete() { rm -f "$@"; }
+
+# delete_recursive <dir> [<dir2> ...]
+delete_recursive() { rm -rf "$@"; }
+
+# symlink <file/dir> <link> [<link2> ...]
+symlink() {
+  local file;
+  file="$1";
+  until [ ! "$2" ]; do
+    ln -sf "$file" "$2";
+    shift;
+  done;
+}
+
+# set_metadata <file> <uid|gid|mode|capabilities|selabel> <value> [<uid|gid|mode|capabilities|selabel_2> <value2> ...]
+set_metadata() {
+  local file i;
+  file="$1";
+  shift;
+  until [ ! "$2" ]; do
+    case $1 in
+      uid) chown $2 "$file";;
+      gid) chown :$2 "$file";;
+      mode) chmod $2 "$file";;
+      capabilities) twrp setcap "$file" $2;;
+      selabel)
+        for i in /system/bin/toybox /system/toolbox /system/bin/toolbox; do
+          LD_LIBRARY_PATH=/system/lib $i chcon -h $2 "$file" || LD_LIBRARY_PATH=/system/lib $i chcon $2 "$file";
+        done || chcon -h $2 "$file" || chcon $2 "$file";
+      ;;
+      *) ;;
+    esac;
+    shift 2;
+  done;
+}
+
+# set_metadata_recursive <dir> <uid|gid|dmode|fmode|capabilities|selabel> <value> [<uid|gid|dmode|fmode|capabilities|selabel_2> <value2> ...]
+set_metadata_recursive() {
+  local dir i;
+  dir="$1";
+  shift;
+  until [ ! "$2" ]; do
+    case $1 in
+      uid) chown -R $2 "$dir";;
+      gid) chown -R :$2 "$dir";;
+      dmode) find "$dir" -type d -exec chmod $2 {} +;;
+      fmode) find "$dir" -type f -exec chmod $2 {} +;;
+      capabilities) find "$dir" -exec twrp setcap {} $2 +;;
+      selabel)
+        for i in /system/bin/toybox /system/toolbox /system/bin/toolbox; do
+          find "$dir" -exec LD_LIBRARY_PATH=/system/lib $i chcon -h $2 {} + || find "$dir" -exec LD_LIBRARY_PATH=/system/lib $i chcon $2 {} +;
+        done || find "$dir" -exec chcon -h $2 '{}' + || find "$dir" -exec chcon $2 '{}' +;
+      ;;
+      *) ;;
+    esac;
+    shift 2;
+  done;
+}
+
+# set_perm <owner> <group> <mode> <file> [<file2> ...]
+set_perm() {
+  local uid gid mod;
+  uid=$1; gid=$2; mod=$3;
+  shift 3;
+  chown $uid:$gid "$@" || chown $uid.$gid "$@";
+  chmod $mod "$@";
+}
+
+# set_perm_recursive <owner> <group> <dir_mode> <file_mode> <dir> [<dir2> ...]
+set_perm_recursive() {
+  local uid gid dmod fmod;
+  uid=$1; gid=$2; dmod=$3; fmod=$4;
+  shift 4;
+  until [ ! "$1" ]; do
+    chown -R $uid:$gid "$1" || chown -R $uid.$gid "$1";
+    find "$1" -type d -exec chmod $dmod {} +;
+    find "$1" -type f -exec chmod $fmod {} +;
+    shift;
+  done;
+}
+
+# ch_con <context> <file> [<file2> ...]
+ch_con() {
+  local con i;
+  con=$1;
+  shift;
+  for i in /system/bin/toybox /system/toolbox /system/bin/toolbox; do
+    LD_LIBRARY_PATH=/system/lib $i chcon -h u:object_r:$con:s0 "$@" || LD_LIBRARY_PATH=/system/lib $i chcon u:object_r:$con:s0 "$@";
+  done || chcon -h u:object_r:$con:s0 "$@" || chcon u:object_r:$con:s0 "$@";
+}
+
+# ch_con_recursive <dir_context> <file_context> <dir> [<dir2> ...]
+ch_con_recursive() {
+  local dcon fcon i;
+  dcon=$1; fcon=$2;
+  shift 2;
+  until [ ! "$1" ]; do
+    for i in /system/bin/toybox /system/toolbox /system/bin/toolbox; do
+      find "$1" -type d -exec LD_LIBRARY_PATH=/system/lib $i chcon -h u:object_r:$dcon:s0 {} + || find "$1" -type d -exec LD_LIBRARY_PATH=/system/lib $i chcon u:object_r:$dcon:s0 {} +;
+      find "$1" -type f -exec LD_LIBRARY_PATH=/system/lib $i chcon -h u:object_r:$fcon:s0 {} + || find "$1" -type f -exec LD_LIBRARY_PATH=/system/lib $i chcon u:object_r:$fcon:s0 {} +;
+    done || ( find "$1" -type d -exec chcon -h u:object_r:$dcon:s0 '{}' + || find "$1" -type d -exec chcon u:object_r:$dcon:s0 '{}' + ) || ( find "$1" -type f -exec chcon -h u:object_r:$fcon:s0 '{}' + || find "$1" -type f -exec chcon u:object_r:$fcon:s0 '{}' + );
+    shift;
+  done;
+}
+
+# restore_con <file/dir> [<file2/dir2> ...]
+restore_con() {
+  local i;
+  for i in /system/bin/toybox /system/toolbox /system/bin/toolbox; do
+    LD_LIBRARY_PATH=/system/lib $i restorecon -R "$@";
+  done || restorecon -R "$@";
+}
+
+# file_getprop <file> <property>
+file_getprop() { grep "^$2=" "$1" | cut -d= -f2-; }
+
+# getprop <property>
+getprop() { test -e /sbin/getprop && /sbin/getprop $1 || grep "^$1=" /default.prop | cut -d= -f2; }
+
+# sha1_check <file> [<sha1_hex> [<sha1_hex2> ...]]
+sha1_check() {
+  local sum=$(sha1sum $1 | cut -c-40);
+  if [ ! "$2" ] || $(is_substring $sum "$*"); then
+    echo $sum;
+  fi;
+}
+
+# apply_patch <src_file> <tgt_file> <tgt_sha1> <tgt_size> [<src_sha1_1>:<patch1> [<src_sha1_2>:<patch2> ...]]
+apply_patch() {
+  LD_LIBRARY_PATH=/system/lib applypatch "$@";
+}
+
+# apply_patch_check <file> [<sha1_hex> [<sha1_hex2> ...]]
+apply_patch_check() {
+  LD_LIBRARY_PATH=/system/lib applypatch -c "$@";
+}
+
+# apply_patch_space <bytes>
+apply_patch_space() {
+  LD_LIBRARY_PATH=/system/lib applypatch -s $1;
+}
+
+# abort [<message>]
+abort() { ui_print "$*"; exit 1; }
+
+# assert "<command>" ["<command2>"]
+assert() {
+  until [ ! "$1" ]; do
+    $1;
+    test $? != 0 && abort 'assert failed('"$1"')';
+    shift;
+  done;
+}
+
+# backup_files <file> [<file2> ...]
+backup_files() {
+  until [ ! "$1" ]; do
+    test ! -e "$1.bak" && cp -pf "$1" "$1.bak";
+    shift;
+  done;
+}
+
+# restore_files <file> [<file2> ...]
+restore_files() {
+  until [ ! "$1" ]; do
+    mv -f "${1}.bak" "$1";
+    shift;
+  done;
+}
+
+############################################################################################################################
+## Additional useful functions
+
+# contains <string> <substring>  # We can also use is_substring edify funtion from above
+contains() { test "${1#*$2}" != "$1" && return 0 || return 1; }
+
+# replace_string <file> <if search string> <original string> <replacement string> <scope>
+replace_string() {
+  test "$5" == "global" && local scope=g;
+  if [ -z "$(grep "$2" $1)" ]; then
+    sed -i "s;${3};${4};${scope}" $1;
+  fi;
+}
+
+# replace_section <file> <begin search string> <end search string> <replacement string>
+replace_section() {
+  local begin endstr last end;
+  begin=`grep -n "$2" $1 | head -n1 | cut -d: -f1`;
+  if [ "$begin" ]; then
+    if [ "$3" == " " -o -z "$3" ]; then
+      endstr='^[[:space:]]*$';
+      last=$(wc -l $1 | cut -d\  -f1);
+    else
+      endstr="$3";
+    fi;
+    for end in $(grep -n "$endstr" $1 | cut -d: -f1) $last; do
+      if [ "$end" ] && [ "$begin" -lt "$end" ]; then
+        sed -i "${begin},${end}d" $1;
+        test "$end" == "$last" && echo >> $1;
+        sed -i "${begin}s;^;${4}\n;" $1;
+        break;
+      fi;
+    done;
+  fi;
+}
+
+# remove_section <file> <begin search string> <end search string>
+remove_section() {
+  local begin endstr last end;
+  begin=`grep -n "$2" $1 | head -n1 | cut -d: -f1`;
+  if [ "$begin" ]; then
+    if [ "$3" == " " -o -z "$3" ]; then
+      endstr='^[[:space:]]*$';
+      last=$(wc -l $1 | cut -d\  -f1);
+    else
+      endstr="$3";
+    fi;
+    for end in $(grep -n "$endstr" $1 | cut -d: -f1) $last; do
+      if [ "$end" ] && [ "$begin" -lt "$end" ]; then
+        sed -i "${begin},${end}d" $1;
+        break;
+      fi;
+    done;
+  fi;
+}
+
+# insert_line <file> <if search string> <before|after> <line match string> <inserted line>
+insert_line() {
+  local offset line;
+  if [ -z "$(grep "$2" $1)" ]; then
+    case $3 in
+      before) offset=0;;
+      after) offset=1;;
+    esac;
+    line=$((`grep -n "$4" $1 | head -n1 | cut -d: -f1` + offset));
+    if [ -f $1 -a "$line" ] && [ "$(wc -l $1 | cut -d\  -f1)" -lt "$line" ]; then
+      echo "$5" >> $1;
+    else
+      sed -i "${line}s;^;${5}\n;" $1;
+    fi;
+  fi;
+}
+
+# replace_line <file> <line replace string> <replacement line>
+replace_line() {
+  if [ ! -z "$(grep "$2" $1)" ]; then
+    local line=`grep -n "$2" $1 | head -n1 | cut -d: -f1`;
+    sed -i "${line}s;.*;${3};" $1;
+  fi;
+}
+
+# remove_line <file> <line match string>
+remove_line() {
+  if [ ! -z "$(grep "$2" $1)" ]; then
+    local line=`grep -n "$2" $1 | head -n1 | cut -d: -f1`;
+    sed -i "${line}d" $1;
+  fi;
+}
+
+# prepend_file <file> <if search string> <patch file>
+prepend_file() {
+  if [ -z "$(grep "$2" $1)" ]; then
+    echo "$(cat $3 $1)" > $1;
+  fi;
+}
+
+# insert_file <file> <if search string> <before|after> <line match string> <patch file>
+insert_file() {
+  local offset line;
+  if [ -z "$(grep "$2" $1)" ]; then
+    case $3 in
+      before) offset=0;;
+      after) offset=1;;
+    esac;
+    line=$((`grep -n "$4" $1 | head -n1 | cut -d: -f1` + offset));
+    sed -i "${line}s;^;\n;" $1;
+    sed -i "$((line - 1))r $5" $1;
+  fi;
+}
+
+# append_file <file> <if search string> <patch file>
+append_file() {
+  if [ -z "$(grep "$2" $1)" ]; then
+    echo -ne "\n" >> $1;
+    cat $3 >> $1;
+    echo -ne "\n" >> $1;
+  fi;
+}
+
+# replace_file <file> <permissions> <patch file>
+replace_file() {
+  cp -pf $3 $1;
+  chmod $2 $1;
+}
+
+# dump <boot> or <recovery> [<path to save img>]
+dump() {
+  local target block out trim;
+  case "$1" in
+    boot|recovery) target="$1" ;;
+    *) return 1 ;;
+  esac;
+
+  if [ -e /dev/block/bootdevice/by-name/$target ]; then
+    block=/dev/block/bootdevice/by-name/$target;
+  elif [ -e /dev/block/platform/*/by-name/$target ]; then
+    block=/dev/block/platform/*/by-name/$target;
+  elif [ -e /dev/block/platform/*/*/by-name/$target ]; then
+    block=/dev/block/platform/*/*/by-name/$target;
+  fi;
+  if [ -z "$block" ]; then return 1; fi;
+  block=$(echo -n $block);
+
+  ui_print "Dumping \"$block\" ...";
+  out="/sdcard/$(basename "$block").img";
+  [ -n "$2" ] && out="$2";
+  dd if="$block" of="$out";
+
+  trim=$(od -Ad -tx8 $out | tail -n3 | sed 's/*/-/g');
+  if [ "$(echo $trim | awk '{ print $(NF-3) $(NF-2) $(NF-1) }')" == "00000000000000000000000000000000-" ]; then
+	ui_print "Trimming \"$out\" ...";
+    truncate -s "$(echo $trim | awk '{ print $(NF-4) }')" "$out";
+  fi;
+}
+
+# getarch (detect device architecture)
+getarch() {
+  abi=`file_getprop /system/build.prop ro.product.cpu.abi`;
+  case $abi in
+    arm*|x86*|mips*) ;;
+    *) abi=`getprop ro.product.cpu.abi`;;
+  esac;
+  case $abi in
+    arm*|x86*|mips*) ;;
+    *) abi=`file_getprop /default.prop ro.product.cpu.abi`;;
+  esac;
+  case $abi in
+    arm64*) arch=arm64;;
+    arm*) arch=arm;;
+    x86_64*) arch=x86_64;;
+    x86*) arch=x86;;
+    mips64*) arch=mips64;;
+    mips*) arch=mips;;
+    *) ui_print "Unknown architecture: $abi";;
+  esac;
+  if [ -n "$arch" ]; then ui_print " Arch is \"${arch}\""; fi;
+}
+
+# getver (detect android version)
+getver() {
+  android_version=`file_getprop /system/build.prop ro.build.version.release`;
+  case $android_version in
+    4.4*) VER=kk;;
+    5*) VER=l;;
+    6*) VER=mm;;
+    7*) VER=n;;
+    8*) VER=o;;
+    9*) VER=p;;
+  esac;
+  if [ -n "$VER" ]; then ui_print " Android Version is \"${VER}\""; fi;
+}
+
+# getdir <file/dir>
+getdir() {
+  case "$1" in
+    */*) dir=${1%/*}; [ -z $dir ] && echo "/" || echo $dir ;;
+    *) echo "." ;;
+  esac
+}
+
+# exists_in_zip <file/dir>
+exists_in_zip() {
+  unzip -l "$ZIPFILE" "$1" | grep -q "$1"
+  return $?
+}
+
+# toupper <string> (change the string of lowecase to uppercase)
+toupper() {
+  echo "$@" | tr '[:lower:]' '[:upper:]'
+}
+
+# grep_prop <string> [<prop file>] (similar to file_getprop edify function above)
+grep_prop() {
+  local REGEX="s/^$1=//p"
+  shift
+  local FILES=$@
+  [ -z "$FILES" ] && FILES='/system/build.prop'
+  sed -n "$REGEX" $FILES 2>/dev/null | head -n 1
+}
+
+# mktouch <file> [<file content>] (create a file with specified content)
+mktouch() {
+  mkdir -p ${1%/*} 2>/dev/null
+  [ -z $2 ] && touch $1 || echo $2 > $1
+  chmod 644 $1
+}
+
+# move_dir <src_dir> <dst_dir>
+move_dir() {
+  if [ -d "$1" ]; then
+    local entry out;
+    find "$1" -type f | while read entry; do
+      out="$(echo "$entry" | sed "s|${1}|${2}|")";
+      mkdir -p "$(dirname "$out")";
+      mv -f "$entry" "$out";
+    done;
+    if [ -z "$(find "$1" -type f)" ]; then
+      rm -rf "$1";
+      rmdir "$1" 2>/dev/null;
+    fi;
+  fi;
+}
+
+# copy_dir <src_dir> <dst_dir>
+copy_dir() {
+  cp -Rpf "$1"/* "$2";
+}
+
+# mount_image <img_path> <mount_dir>
+mount_image() {
+  local loop;
+  [ ! -d $2 ] && mkdir -p $2;
+  if ! is_mounted $2; then
+    echo "Mounting $1 image at $2";
+    mount -t ext4 -o rw,noatime $1 $2 2>/dev/null;
+    for i in 0 1 2 3 4 5 6 7; do
+      is_mounted $2 && break;
+      loop=/dev/block/loop$i;
+      if [ ! -f $loop -o ! -b $loop ]; then
+        mknod $loop b 7 $i;
+      fi;
+      losetup $loop $1 && mount -t ext4 -o loop,noatime $loop $2;
+    done;
+  else
+    echo "Unmounting $1 image at $2";
+    test -f $1 && umount $2;
+    loop=$(mount | grep $2 | cut -d" " -f1);
+    [ -f $loop -a -b $loop ] && losetup -d $loop;
+  fi;
+  echo "Working directory remounted.";
+}
+############################################################################################################################
+
+$BOOTMODE && TMP="/dev/tmp" || TMP="/tmp";
+mount_ '/'
+package_extract_file META-INF/com/google/android/updater-script $TMP/test/updater-script || abort "Can not extract updater-script. Do you have it in package?"
+chmod 777 $TMP/test $TMP/test/updater-script
+. $TMP/test/updater-script
+
+rm -rf $TMP/test
+exit 0
